@@ -6,6 +6,7 @@ package akka.persistence.testkit.internal
 
 import scala.collection.immutable
 import scala.reflect.ClassTag
+import scala.util.{ Failure, Success, Try }
 import scala.util.control.NonFatal
 
 import akka.actor.testkit.typed.scaladsl.ActorTestKit
@@ -102,19 +103,7 @@ import akka.persistence.typed.internal.EventSourcedBehaviorImpl
   persistenceTestKit.clearByPersistenceId(persistenceId.id)
 
   override def runCommand(command: Command): CommandResult[Command, Event, State] = {
-    if (serializationSettings.enabled && serializationSettings.verifyCommands)
-      verifySerializationAndThrow(command, "Command")
-
-    if (serializationSettings.enabled && !emptyStateVerified) {
-      internalActor ! EventSourcedBehaviorImpl.GetState(stateProbe.ref)
-      val emptyState = stateProbe.receiveMessage()
-      verifySerializationAndThrow(emptyState, "Empty State")
-      emptyStateVerified = true
-    }
-
-    // FIXME we can expand the api of persistenceTestKit to read from storage from a seqNr instead
-    val oldEvents =
-      persistenceTestKit.persistedInStorage(persistenceId.id).map(_.asInstanceOf[Event])
+    val oldEvents = preCommandCheck(command)
 
     actor ! command
 
@@ -124,36 +113,37 @@ import akka.persistence.typed.internal.EventSourcedBehaviorImpl
     val newEvents =
       persistenceTestKit.persistedInStorage(persistenceId.id).map(_.asInstanceOf[Event]).drop(oldEvents.size)
 
-    if (serializationSettings.enabled) {
-      if (serializationSettings.verifyEvents) {
-        newEvents.foreach(verifySerializationAndThrow(_, "Event"))
-      }
-
-      if (serializationSettings.verifyState)
-        verifySerializationAndThrow(newState, "State")
-    }
+    postCommandCheck(newEvents, newState, None)
 
     CommandResultImpl[Command, Event, State, Nothing](command, newEvents, newState, None)
   }
 
-  override def runCommand[R](creator: ActorRef[R] => Command): CommandResultWithReply[Command, Event, State, R] = {
+  override def runCommand[R](creator: ActorRef[R] => Command, expectReply: Boolean): CommandResultWithReply[Command, Event, State, R] = {
     val replyProbe = actorTestKit.createTestProbe[R]()
     val command = creator(replyProbe.ref)
-    val result = runCommand(command)
+    val oldEvents = preCommandCheck(command)
 
-    val reply = try {
-      replyProbe.receiveMessage()
-    } catch {
-      case NonFatal(_) =>
+    actor ! command
+
+    val reply = Try(replyProbe.receiveMessage()) match {
+      case Success(reply) => Some(reply)
+      case Failure(_) if !expectReply =>
+        replyProbe.stop()
+        None
+      case _ =>
+        replyProbe.stop()
         throw new AssertionError(s"Missing expected reply for command [$command].")
-    } finally {
-      replyProbe.stop()
     }
 
-    if (serializationSettings.enabled && serializationSettings.verifyCommands)
-      verifySerializationAndThrow(reply, "Reply")
+    internalActor ! EventSourcedBehaviorImpl.GetState(stateProbe.ref)
+    val newState = stateProbe.receiveMessage()
 
-    CommandResultImpl[Command, Event, State, R](result.command, result.events, result.state, Some(reply))
+    val newEvents =
+      persistenceTestKit.persistedInStorage(persistenceId.id).map(_.asInstanceOf[Event]).drop(oldEvents.size)
+
+    postCommandCheck(newEvents, newState, reply)
+
+    CommandResultImpl[Command, Event, State, R](command, newEvents, newState, reply)
   }
 
   override def restart(): RestartResult[State] = {
@@ -172,6 +162,36 @@ import akka.persistence.typed.internal.EventSourcedBehaviorImpl
   override def clear(): Unit = {
     persistenceTestKit.clearByPersistenceId(persistenceId.id)
     restart()
+  }
+
+  private def preCommandCheck(command: Command): Seq[Event] = {
+    if (serializationSettings.enabled && serializationSettings.verifyCommands)
+      verifySerializationAndThrow(command, "Command")
+
+    if (serializationSettings.enabled && !emptyStateVerified) {
+      internalActor ! EventSourcedBehaviorImpl.GetState(stateProbe.ref)
+      val emptyState = stateProbe.receiveMessage()
+      verifySerializationAndThrow(emptyState, "Empty State")
+      emptyStateVerified = true
+    }
+
+    // FIXME we can expand the api of persistenceTestKit to read from storage from a seqNr instead
+    persistenceTestKit.persistedInStorage(persistenceId.id).map(_.asInstanceOf[Event])
+  }
+
+  private def postCommandCheck(events: Seq[Event], state: State, reply: Option[Any]) = {
+    if (serializationSettings.enabled) {
+      if (serializationSettings.verifyEvents) {
+        events.foreach(verifySerializationAndThrow(_, "Event"))
+      }
+
+      if (serializationSettings.verifyState)
+        verifySerializationAndThrow(state, "State")
+
+      if (serializationSettings.verifyCommands) {
+        verifySerializationAndThrow(reply, "Reply")
+      }
+    }
   }
 
   private def verifySerializationAndThrow(obj: Any, errorMessagePrefix: String): Unit = {

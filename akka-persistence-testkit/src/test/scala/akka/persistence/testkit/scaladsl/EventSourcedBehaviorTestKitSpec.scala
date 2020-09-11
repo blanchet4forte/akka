@@ -24,7 +24,6 @@ import akka.persistence.typed.scaladsl.Effect
 import akka.persistence.typed.scaladsl.EventSourcedBehavior
 import akka.serialization.DisabledJavaSerializer
 import akka.serialization.jackson.CborSerializable
-import akka.util.unused
 
 object EventSourcedBehaviorTestKitSpec {
 
@@ -32,14 +31,24 @@ object EventSourcedBehaviorTestKitSpec {
     sealed trait Command
     case object Increment extends Command with CborSerializable
     final case class IncrementWithConfirmation(replyTo: ActorRef[Done]) extends Command with CborSerializable
+    final case class IncrementWithNoReply(replyTo: ActorRef[Done]) extends Command with CborSerializable
+    final case class IncrementWithAsyncReply(replyTo: ActorRef[Done]) extends Command with CborSerializable
+    final case class TransitionWithAsyncReply(replyTo: ActorRef[Done]) extends Command with CborSerializable
+
+    private case class AsyncReply(replyTo: ActorRef[Done]) extends Command with CborSerializable
+    private case class IncrementAndFinalizeWithAsyncReply(replyTo: ActorRef[Done]) extends Command with CborSerializable
+
     case class IncrementSeveral(n: Int) extends Command with CborSerializable
     final case class GetValue(replyTo: ActorRef[State]) extends Command with CborSerializable
 
     sealed trait Event
     final case class Incremented(delta: Int) extends Event with CborSerializable
+    final case object Transitioned extends Event with CborSerializable
+    final case object Finalized extends Event with CborSerializable
 
     sealed trait State
     final case class RealState(value: Int, history: Vector[Int]) extends State with CborSerializable
+    final case class IntermediateState(value: Int, history: Vector[Int]) extends State with CborSerializable
 
     case object IncrementWithNotSerializableEvent extends Command with CborSerializable
     final case class NotSerializableEvent(delta: Int) extends Event
@@ -62,7 +71,7 @@ object EventSourcedBehaviorTestKitSpec {
       Behaviors.setup(ctx => counter(ctx, persistenceId, emptyState))
 
     private def counter(
-        @unused ctx: ActorContext[Command],
+        ctx: ActorContext[Command],
         persistenceId: PersistenceId,
         emptyState: State): EventSourcedBehavior[Command, Event, State] = {
       EventSourcedBehavior.withEnforcedReplies[Command, Event, State](
@@ -72,6 +81,25 @@ object EventSourcedBehaviorTestKitSpec {
           command match {
             case Increment =>
               Effect.persist(Incremented(1)).thenNoReply()
+
+            case IncrementWithNoReply(_) =>
+              Effect.persist(Incremented(1)).thenNoReply()
+
+            case IncrementWithAsyncReply(replyTo) =>
+              Effect.persist[Event, State](Incremented(1)).thenRun(_ => ctx.self ! AsyncReply(replyTo)).thenNoReply()
+
+            case AsyncReply(replyTo) =>
+              ctx.log.info("Async reply")
+              Effect.persist(Incremented(1)).thenReply(replyTo)(_ => Done)
+
+            case TransitionWithAsyncReply(replyTo) =>
+              Effect
+                .persist(Incremented(1), Transitioned)
+                .thenRun((_: State) => ctx.self ! IncrementAndFinalizeWithAsyncReply(replyTo))
+                .thenNoReply()
+
+            case IncrementAndFinalizeWithAsyncReply(replyTo) =>
+              Effect.persist(Incremented(1), Finalized).thenReply(replyTo)(_ => Done)
 
             case IncrementWithConfirmation(replyTo) =>
               Effect.persist(Incremented(1)).thenReply(replyTo)(_ => Done)
@@ -105,7 +133,15 @@ object EventSourcedBehaviorTestKitSpec {
             RealState(value + delta, history :+ value)
           case (RealState(value, history), IncrementedWithNotSerializableState(delta)) =>
             NotSerializableState(value + delta, history :+ value)
-          case (state: NotSerializableState, _) =>
+          case (RealState(value, history), Transitioned) =>
+            IntermediateState(value, history)
+          case (IntermediateState(value, history), Incremented(delta)) =>
+            if (delta <= 0)
+              throw new IllegalStateException("Delta must be positive")
+            IntermediateState(value + delta, history :+ value)
+          case (IntermediateState(value, history), Finalized) =>
+            RealState(value, history)
+          case (state, _) =>
             throw new IllegalStateException(state.toString)
         })
     }
@@ -143,6 +179,29 @@ class EventSourcedBehaviorTestKitSpec
         // wrong event type
         result2.eventOfType[TestCounter.NotSerializableEvent].delta should ===(1)
       }
+    }
+
+    "run command with no reply" in {
+      val eventSourcedTestKit = createTestKit()
+      val result =
+        eventSourcedTestKit.runCommand(replyTo => TestCounter.IncrementWithNoReply(replyTo), expectReply = false)
+      result.event should ===(TestCounter.Incremented(1))
+    }
+
+    "run command with async reply" in {
+      val eventSourcedTestKit = createTestKit()
+      val result = eventSourcedTestKit.runCommand(replyTo => TestCounter.IncrementWithAsyncReply(replyTo))
+      result.event should ===(TestCounter.Incremented(1))
+      result.reply should ===(Done)
+    }
+
+    "run command with state transitions and async reply" in {
+      val eventSourcedTestKit = createTestKit()
+      val result = eventSourcedTestKit.runCommand(replyTo => TestCounter.TransitionWithAsyncReply(replyTo))
+      result.events should ===(
+        List(TestCounter.Incremented(1), TestCounter.Transitioned, TestCounter.Incremented(1), TestCounter.Finalized))
+      result.state should ===(TestCounter.RealState(2, Vector(0, 1)))
+      result.reply should ===(Done)
     }
 
     "run command emitting several events" in {

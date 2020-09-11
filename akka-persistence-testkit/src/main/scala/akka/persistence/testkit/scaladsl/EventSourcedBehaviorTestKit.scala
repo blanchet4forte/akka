@@ -202,7 +202,7 @@ object EventSourcedBehaviorTestKit {
    * Run one command  with a `replyTo: ActorRef[R]` through the behavior. The returned result contains emitted events,
    * the state after applying the events, and the reply.
    */
-  def runCommand[R](creator: ActorRef[R] => Command): CommandResultWithReply[Command, Event, State, R]
+  def runCommand[R](creator: ActorRef[R] => Command, expectReply: Boolean = true): CommandResultWithReply[Command, Event, State, R]
 
   /**
    * Restart the behavior, which will then recover from stored snapshot and events. Can be used for testing
